@@ -1,0 +1,32 @@
+# Build output (recreated by build_exe.bat)
+.build/
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+
+# Release files are published on GitHub Releases, not committed
+*.exe
+*.zip
+*.rar
+*.7z
+
+# Per-user settings created when running from source
+settings.json
+
+# Virtual environments
+.venv/
+venv/
+
+# Test videos
+*.mp4
+*.mkv
+*.mov
+
+# OS / editor files
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
