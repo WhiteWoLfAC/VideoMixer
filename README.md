@@ -6,7 +6,7 @@
 
 ![Version](https://img.shields.io/badge/version-2.1.0-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6)
 ![FFmpeg](https://img.shields.io/badge/requires-FFmpeg-007808?logo=ffmpeg&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -47,7 +47,7 @@ All of it runs from one file: `VideoMixer.exe`, or `video_mixer.py`.
 
 ## 📦 Requirements
 
-- **Windows 10/11 (64-bit)** for the `.exe`. The `.py` version also runs on macOS and Linux.
+- **Windows 10/11 (64-bit)** only, for now. Both `VideoMixer.exe` and `video_mixer.py` are tested on Windows only; macOS and Linux are not supported yet.
 - **FFmpeg** (`ffmpeg` + `ffprobe`), found in either of these places:
   - next to `VideoMixer.exe` (or in an `ffmpeg\bin\` or `bin\` subfolder), **or**
   - on the system PATH
