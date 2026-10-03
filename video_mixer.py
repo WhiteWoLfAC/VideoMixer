@@ -6,6 +6,7 @@ Batch-process screen recordings with FFmpeg:
 
   * mixes audio track 1 (system sounds) + track 2 (microphone) into a new "Mix" track
   * keeps the original tracks, renamed ("System sounds", "Microphone")
+  * configurable track handling: Mix on/off, keep originals, what to do with 1-track / silent files
   * re-encodes the video to AV1 or H.264 on CPU, NVIDIA (NVENC), Intel (QSV) or AMD (AMF)
 
 Settings are stored in settings.json next to this script / exe.
@@ -57,6 +58,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 APP_NAME = "Video Mixer"
+APP_VERSION = "2.0"
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "settings.json"
 INPUT_EXTENSIONS = (".mp4",)
@@ -153,6 +155,10 @@ def video_args(encoder: str, quality: int, preset: str, ten_bit: bool) -> list[s
     return ["-c:v", encoder, *args, "-pix_fmt", pix]
 
 
+SINGLE_TRACK_MODES = {"keep": "keep the track", "skip": "skip the file"}
+NO_AUDIO_MODES = {"encode": "encode video only", "skip": "skip the file"}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Settings
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +176,10 @@ class Settings:
     system_title: str = "System sounds"
     mic_title: str = "Microphone"
     single_title: str = "Audio"
+    mix_enabled: bool = True  # create the "Mix" track when a file has 2+ audio tracks
+    keep_originals: bool = True  # keep the original tracks next to the Mix
+    single_track: str = "keep"  # files with 1 audio track: "keep" | "skip"
+    no_audio: str = "encode"  # files without audio: "encode" (video only) | "skip"
     input_dir: str = ""  # empty = current folder
     output_dir: str = "Processed - {backend}"  # relative to the input folder; {backend} / {codec} placeholders
     suffix: str = "-Mix"
@@ -186,6 +196,10 @@ class Settings:
                 setattr(s, f.name, data[f.name])
         if s.encoder not in ENCODERS:
             s.apply_encoder(cls.encoder)
+        if s.single_track not in SINGLE_TRACK_MODES:
+            s.single_track = cls.single_track
+        if s.no_audio not in NO_AUDIO_MODES:
+            s.no_audio = cls.no_audio
         return s
 
     def save(self) -> None:
@@ -213,6 +227,13 @@ class Settings:
             name = self.output_dir
         p = Path(name).expanduser()
         return p if p.is_absolute() else self.input_path() / p
+
+    def audio_summary(self) -> str:
+        if not self.mix_enabled:
+            mode = "no Mix"
+        else:
+            mode = "Mix + originals" if self.keep_originals else "Mix only"
+        return f"{mode} · 1-track: {self.single_track} · no audio: {self.no_audio}"
 
     def summary(self) -> str:
         spec = self.spec
@@ -305,20 +326,40 @@ def probe(path: Path) -> MediaInfo:
                      has_video=video is not None)
 
 
-def build_command(s: Settings, src: Path, dst: Path, info: MediaInfo) -> list[str]:
-    cmd = [FFMPEG, "-y", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src)]
+def audio_plan(s: Settings, n: int) -> str | None:
+    """Short description of what happens to a file's n audio tracks, or None if the file is skipped."""
+    if n == 0:
+        return "no audio → video only" if s.no_audio == "encode" else None
+    if n == 1:
+        return "1 track → keep" if s.single_track == "keep" else None
+    if not s.mix_enabled:
+        return f"{n} tracks → keep"
+    return f"{n} tracks → Mix" + (" + originals" if s.keep_originals else " only")
 
-    if info.audio_streams >= 2:
-        cmd += ["-filter_complex", "[0:a:0][0:a:1]amix=inputs=2:duration=longest[mix]",
-                "-map", "0:v:0", "-map", "[mix]", "-map", "0:a:0", "-map", "0:a:1",
-                "-metadata:s:a:0", f"title={s.mix_title}",
-                "-metadata:s:a:1", f"title={s.system_title}",
-                "-metadata:s:a:2", f"title={s.mic_title}",
-                "-disposition:a:0", "default", "-disposition:a:1", "0", "-disposition:a:2", "0"]
-    elif info.audio_streams == 1:
-        cmd += ["-map", "0:v:0", "-map", "0:a:0", "-metadata:s:a:0", f"title={s.single_title}"]
-    else:
-        cmd += ["-map", "0:v:0"]
+
+def track_title(s: Settings, i: int, n: int) -> str:
+    if n == 1:
+        return s.single_title
+    return (s.system_title, s.mic_title)[i] if i < 2 else f"Track {i + 1}"
+
+
+def build_command(s: Settings, src: Path, dst: Path, info: MediaInfo) -> list[str]:
+    cmd = [FFMPEG, "-y", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src), "-map", "0:v:0"]
+
+    n = info.audio_streams
+    titles: list[str] = []
+    originals = range(n)
+    if n >= 2 and s.mix_enabled:
+        inputs = "".join(f"[0:a:{i}]" for i in range(n))
+        cmd += ["-filter_complex", f"{inputs}amix=inputs={n}:duration=longest[mix]", "-map", "[mix]"]
+        titles.append(s.mix_title)
+        if not s.keep_originals:
+            originals = range(0)
+    for i in originals:
+        cmd += ["-map", f"0:a:{i}"]
+        titles.append(track_title(s, i, n))
+    for i, title in enumerate(titles):  # the first track (the Mix, if any) is the default
+        cmd += [f"-metadata:s:a:{i}", f"title={title}", f"-disposition:a:{i}", "default" if i == 0 else "0"]
 
     cmd += video_args(s.encoder, s.quality, s.preset, s.ten_bit)
     cmd += ["-color_range", "tv"]
@@ -485,23 +526,40 @@ def process_all(s: Settings) -> None:
         pause()
         return
 
+    with console.status("Reading media info…", spinner="dots"):
+        infos = {p: probe(p) for p in todo}
+    by_rule = [p for p in todo if infos[p].has_video and audio_plan(s, infos[p].audio_streams) is None]
+    todo = [p for p in todo if p not in by_rule]
+
     table = Table(box=box.SIMPLE_HEAD, header_style=f"bold {ACCENT2}", expand=False)
     table.add_column("#", justify="right", style="dim")
     table.add_column("File")
     table.add_column("Size", justify="right")
+    table.add_column("Audio")
     table.add_column("Status")
     for i, p in enumerate(todo, 1):
-        table.add_row(str(i), p.name, fmt_size(p.stat().st_size), "[green]queued[/]")
+        info = infos[p]
+        plan = audio_plan(s, info.audio_streams) if info.has_video else "[red]no video stream[/]"
+        table.add_row(str(i), p.name, fmt_size(p.stat().st_size), plan, "[green]queued[/]")
+    for p in by_rule:
+        n = infos[p].audio_streams
+        reason = "no audio" if n == 0 else "only 1 audio track"
+        table.add_row("", f"[dim]{p.name}[/]", f"[dim]{fmt_size(p.stat().st_size)}[/]",
+                      f"[dim]{n} track(s)[/]", f"[dim]skip ({reason})[/]")
     for p in skipped:
-        table.add_row("", f"[dim]{p.name}[/]", f"[dim]{fmt_size(p.stat().st_size)}[/]", "[dim]skip (already mixed)[/]")
+        table.add_row("", f"[dim]{p.name}[/]", f"[dim]{fmt_size(p.stat().st_size)}[/]", "",
+                      "[dim]skip (already mixed)[/]")
     console.print(table)
+    console.print(f"  Audio  → [bold]{s.audio_summary()}[/]")
     console.print(f"  Output → [bold]{s.output_path()}[/]\n")
+    skipped += by_rule
 
+    if not todo:
+        console.print("[yellow]Nothing to process with the current audio track settings.[/]")
+        pause()
+        return
     if not questionary.confirm(f"Process {len(todo)} file(s)?", default=True, style=QSTYLE).ask():
         return
-
-    with console.status("Reading media info…", spinner="dots"):
-        infos = {p: probe(p) for p in todo}
 
     out_dir = s.output_path()
     try:
@@ -656,12 +714,13 @@ def header(s: Settings) -> None:
 
     body = Group(
         Text(s.summary(), style=f"bold {ACCENT2}"),
+        Text(f"Audio  {s.audio_summary()}", style=ACCENT2),
         Text(f"Input  {s.input_path()}", style="dim"),
         Text(f"Output {s.output_path()}", style="dim"),
         Text(""),
         status,
     )
-    title = Text.assemble(("▶ ", ACCENT2), (APP_NAME.upper(), f"bold {ACCENT}"))
+    title = Text.assemble(("▶ ", ACCENT2), (APP_NAME.upper(), f"bold {ACCENT}"), (f" v{APP_VERSION}", "dim"))
     console.print(Panel(body, title=title, subtitle="[dim]mix audio · encode AV1 / H.264",
                         border_style=ACCENT, box=box.ROUNDED, padding=(0, 2)))
 
@@ -702,7 +761,7 @@ def settings_menu(s: Settings) -> None:
                    "ten_bit", disabled=None if av1 else "AV1 only"),
             Choice(row("Output frame rate", "keep source" if s.fps == "source" else f"{s.fps} fps"), "fps"),
             Choice(row("Audio bitrate", s.audio_bitrate), "bitrate"),
-            Choice(row("Track names", f"{s.mix_title} / {s.system_title} / {s.mic_title}"), "titles"),
+            Choice(row("Audio tracks", s.audio_summary()), "tracks"),
             Separator(),
             Choice(row("Input folder", s.input_dir or "(current folder)"), "input"),
             Choice(row("Output folder", s.output_dir), "output"),
@@ -767,14 +826,8 @@ def settings_menu(s: Settings) -> None:
             if val:
                 s.audio_bitrate = val
 
-        elif key == "titles":
-            nonempty = lambda v: bool(v.strip()) or "Name cannot be empty"  # noqa: E731
-            for attr, label in (("mix_title", "Mixed track (1 + 2)"), ("system_title", "Original track 1"),
-                                ("mic_title", "Original track 2"), ("single_title", "Only track (1-track files)")):
-                val = ask_text(f"{label}:", getattr(s, attr), nonempty)
-                if val is None:
-                    break
-                setattr(s, attr, val.strip())
+        elif key == "tracks":
+            tracks_menu(s)
 
         elif key == "input":
             val = questionary.path("Input folder (empty = current folder):", default=s.input_dir,
@@ -800,6 +853,55 @@ def settings_menu(s: Settings) -> None:
                 s.__dict__.update(asdict(Settings()))
                 ensure_available_encoder(s)
 
+        s.save()
+
+
+def tracks_menu(s: Settings) -> None:
+    """Audio track options: Mix on/off, keep originals, 1-track and silent files, track names."""
+    while True:
+        header(s)
+        row = lambda k, v: f"{k:<28}{v}"  # noqa: E731
+        onoff = lambda b: "on" if b else "off"  # noqa: E731
+        choices = [
+            Choice(row('Create "Mix" track', onoff(s.mix_enabled)), "mix"),
+            Choice(row("Keep original tracks", onoff(s.keep_originals) if s.mix_enabled else "always (no Mix)"),
+                   "keep", disabled=None if s.mix_enabled else "only with Mix on"),
+            Choice(row("Files with 1 audio track", SINGLE_TRACK_MODES[s.single_track]), "single"),
+            Choice(row("Files with no audio", NO_AUDIO_MODES[s.no_audio]), "none"),
+            Choice(row("Track names", f"{s.mix_title} / {s.system_title} / {s.mic_title} / {s.single_title}"),
+                   "titles"),
+            Separator(),
+            Choice("← Back", "back"),
+        ]
+        key = questionary.select("Audio tracks", choices=choices, style=QSTYLE, use_shortcuts=False,
+                                 instruction="(↑↓ enter)").ask()
+        if key in (None, "back"):
+            return
+
+        if key == "mix":
+            s.mix_enabled = not s.mix_enabled
+        elif key == "keep":
+            s.keep_originals = not s.keep_originals
+        elif key == "single":
+            val = questionary.select("Files with only 1 audio track (nothing to mix)",
+                                     choices=[Choice(v, k) for k, v in SINGLE_TRACK_MODES.items()],
+                                     default=s.single_track, style=QSTYLE).ask()
+            if val:
+                s.single_track = val
+        elif key == "none":
+            val = questionary.select("Files with no audio track",
+                                     choices=[Choice(v, k) for k, v in NO_AUDIO_MODES.items()],
+                                     default=s.no_audio, style=QSTYLE).ask()
+            if val:
+                s.no_audio = val
+        elif key == "titles":
+            nonempty = lambda v: bool(v.strip()) or "Name cannot be empty"  # noqa: E731
+            for attr, label in (("mix_title", "Mixed track"), ("system_title", "Original track 1"),
+                                ("mic_title", "Original track 2"), ("single_title", "Only track (1-track files)")):
+                val = ask_text(f"{label}:", getattr(s, attr), nonempty)
+                if val is None:
+                    break
+                setattr(s, attr, val.strip())
         s.save()
 
 

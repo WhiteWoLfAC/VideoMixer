@@ -4,7 +4,7 @@
 
 **Batch-mix system + microphone audio in screen recordings and re-encode to AV1 / H.264 on CPU or GPU.**
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![FFmpeg](https://img.shields.io/badge/requires-FFmpeg-007808?logo=ffmpeg&logoColor=white)
@@ -29,6 +29,7 @@ All of it runs from one file: `VideoMixer.exe`, or `video_mixer.py`.
 | Feature | Description |
 |---|---|
 | **Audio mixing** | Tracks 1 + 2 → a new "Mix" track, set as the default track so players use it automatically |
+| **Track control** *(v2)* | Turn the Mix track on/off, keep or drop the original tracks, and choose what happens to files with 1 or 0 audio tracks |
 | **Track naming** | Output tracks: `Mix` · `System sounds` · `Microphone` (you can rename them) |
 | **Two codecs** | AV1 (smaller files) or H.264 (plays everywhere) |
 | **GPU auto-detection** | Test-encodes on startup to find which encoders really work on this PC |
@@ -94,8 +95,10 @@ Use the **↑ ↓ arrow keys** and **Enter** in every menu.
                                              └── audio: "Microphone"     (copy of track 2)
 ```
 
-- A file with **one** audio track keeps that track and names it "Audio".
-- A file with **no** audio gets its video re-encoded only.
+- Files with **3+** audio tracks: all tracks go into the Mix, and extra originals are named "Track 3", "Track 4", …
+- A file with **one** audio track keeps that track and names it "Audio" (or is skipped — see *Audio tracks* below).
+- A file with **no** audio gets its video re-encoded only (or is skipped).
+- Before you confirm, the file list shows an **Audio** column with what will happen to each file.
 - All audio is encoded as AAC (192k by default).
 - Files whose names already end in the suffix (`-Mix`) are **skipped**, so running the app again only processes new files.
 
@@ -131,11 +134,29 @@ The header always shows your current settings and which backends are available.
 | 10-bit color | on | AV1 only; reduces color banding |
 | Output frame rate | 60 | 24 / 25 / 30 / 50 / 60 / 120, custom, or **keep source** |
 | Audio bitrate | 192k | 96k – 320k |
-| Track names | Mix / System sounds / Microphone | Plus "Audio" for single-track files |
+| Audio tracks | Mix + originals | Opens the track settings page (see below) |
 | Input folder | *(current folder)* | Where your videos are |
 | Output folder | `Processed - {backend}` | Relative paths are inside the input folder. `{backend}` and `{codec}` are replaced automatically |
 | Output suffix | `-Mix` | Added to output names; files ending with it are skipped |
 | Reset to defaults | — | Restores all of the above |
+
+### Audio tracks *(new in v2)*
+
+| Setting | Default | Notes |
+|---|---|---|
+| Create "Mix" track | on | Off = no mixing; the original tracks are just re-encoded and named |
+| Keep original tracks | on | Off = the output has **only** the Mix track (only when Mix is on) |
+| Files with 1 audio track | keep the track | Or **skip the file** (nothing to mix) |
+| Files with no audio | encode video only | Or **skip the file** |
+| Track names | Mix / System sounds / Microphone / Audio | The last one is used for 1-track files |
+
+The first track in the output is always the default track: the Mix when it exists, otherwise track 1.
+
+| Source file | Mix + originals | Mix only | Mix off |
+|---|---|---|---|
+| 2 tracks | Mix · System sounds · Microphone | Mix | System sounds · Microphone |
+| 1 track | Audio | Audio | Audio |
+| 0 tracks | video only | video only | video only |
 
 ### Encoder reference
 
