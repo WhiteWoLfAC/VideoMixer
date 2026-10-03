@@ -4,7 +4,7 @@
 
 **Batch-mix system + microphone audio in screen recordings and re-encode to AV1 / H.264 on CPU or GPU.**
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![FFmpeg](https://img.shields.io/badge/requires-FFmpeg-007808?logo=ffmpeg&logoColor=white)
@@ -29,7 +29,8 @@ All of it runs from one file: `VideoMixer.exe`, or `video_mixer.py`.
 | Feature | Description |
 |---|---|
 | **Audio mixing** | Tracks 1 + 2 → a new "Mix" track, set as the default track so players use it automatically |
-| **Track control** *(v2)* | Turn the Mix track on/off, keep or drop the original tracks, and choose what happens to files with 1 or 0 audio tracks |
+| **Track control** | Scans your videos and lists every track number found. For each track, choose **In Mix** and **Keep**, each with its own volume, so you can drop a track completely (e.g. track 3) or make it quieter. The microphone is 75% in the Mix by default |
+| **Add a track** *(v2.1)* | Adds an audio file with the same name as the video (`recording.mp4` + `recording.wav`) as an extra track, e.g. a separately recorded mic |
 | **Track naming** | Output tracks: `Mix` · `System sounds` · `Microphone` (you can rename them) |
 | **Two codecs** | AV1 (smaller files) or H.264 (plays everywhere) |
 | **GPU auto-detection** | Test-encodes on startup to find which encoders really work on this PC |
@@ -81,7 +82,7 @@ winget install Gyan.FFmpeg
 3. Choose **▶ Start processing**, check the file list, and confirm.
 4. Output files are saved to `Processed - <backend>\<name>-Mix.mp4`.
 
-Use the **↑ ↓ arrow keys** and **Enter** in every menu.
+Use the **↑ ↓ arrow keys** and **Enter** in every menu, and **Backspace** to go back (in a list of options, Backspace cancels without changing anything). On the main menu, Backspace does nothing, so you can't exit by accident.
 
 ---
 
@@ -95,7 +96,8 @@ Use the **↑ ↓ arrow keys** and **Enter** in every menu.
                                              └── audio: "Microphone"     (copy of track 2)
 ```
 
-- Files with **3+** audio tracks: all tracks go into the Mix, and extra originals are named "Track 3", "Track 4", …
+- Which tracks go into the Mix and which are kept is set **per track number** in *Audio tracks* (below). By default every track is mixed and kept; track 3 and up are named "Track 3", "Track 4", …
+- With **Add a track** on, an audio file with the same name next to a video becomes one more track (`ext` in the file list).
 - A file with **one** audio track keeps that track and names it "Audio" (or is skipped — see *Audio tracks* below).
 - A file with **no** audio gets its video re-encoded only (or is skipped).
 - Before you confirm, the file list shows an **Audio** column with what will happen to each file.
@@ -134,29 +136,64 @@ The header always shows your current settings and which backends are available.
 | 10-bit color | on | AV1 only; reduces color banding |
 | Output frame rate | 60 | 24 / 25 / 30 / 50 / 60 / 120, custom, or **keep source** |
 | Audio bitrate | 192k | 96k – 320k |
-| Audio tracks | Mix + originals | Opens the track settings page (see below) |
+| Audio tracks | Mix 1+2 · keep 1,2 | Opens the track settings page (see below) |
 | Input folder | *(current folder)* | Where your videos are |
 | Output folder | `Processed - {backend}` | Relative paths are inside the input folder. `{backend}` and `{codec}` are replaced automatically |
 | Output suffix | `-Mix` | Added to output names; files ending with it are skipped |
 | Reset to defaults | — | Restores all of the above |
 
-### Audio tracks *(new in v2)*
+### Audio tracks
+
+When you open this page, the app **scans the input folder** and shows how many audio tracks your videos have:
+
+```
+ Found in input folder: 5 videos → 2 have 3 tracks · 2 have 2 tracks · 1 has 1 track
+
+   Create "Mix" track               on
+     Track      Name                  In Mix    Keep
+ ❯ Track 1    System sounds         ✓ 100%    ✓ 100%    in 5/5 videos
+   Track 2    Microphone            ✓ 75%     ✓ 100%    in 4/5 videos
+   Track 3    Discord               ✗         ✗         in 2/5 videos
+   + Add a track…  (audio file with the same name)
+```
+
+Select a track to change it:
+
+| Option | Meaning |
+|---|---|
+| **In Mix** | The track is mixed into the "Mix" track |
+| **Keep** | The track is also copied to the output as its own track |
+| **Name** | The track's name in the output |
+| **Volume in Mix** | How loud the track is **inside the Mix** |
+| **Volume (own track)** | How loud the track's own kept track is (also used for 1-track files) |
+
+Volumes are in percent: `100` = unchanged, `50` = half as loud, `200` = twice as loud (0–400). Very high values can distort the sound. By default the **Microphone is 75% in the Mix**, so your voice doesn't drown out the game, and every other volume is 100%. The kept tracks always start at 100%, the same as the original.
+
+A track with **In Mix ✗** and **Keep ✗** is removed from the output. A rule only applies to videos that have that track. A 2-track video ignores the Track 3 rule.
 
 | Setting | Default | Notes |
 |---|---|---|
-| Create "Mix" track | on | Off = no mixing; the original tracks are just re-encoded and named |
-| Keep original tracks | on | Off = the output has **only** the Mix track (only when Mix is on) |
+| Create "Mix" track | on | Off = no mixing; tracks marked **Keep** are re-encoded and named |
+| Track 1 / Track 2 / … | In Mix ✓ 100% · Keep ✓ 100% | One row per track number found in your videos. Microphone (track 2) is 75% in the Mix |
+| + Add a track… | off | See *Adding a track* below |
 | Files with 1 audio track | keep the track | Or **skip the file** (nothing to mix) |
 | Files with no audio | encode video only | Or **skip the file** |
-| Track names | Mix / System sounds / Microphone / Audio | The last one is used for 1-track files |
+| Mix / 1-track names | Mix / Audio | The second one is used for 1-track files |
+| ↻ Rescan input folder | — | Scan again after adding videos or changing the input folder |
 
-The first track in the output is always the default track: the Mix when it exists, otherwise track 1.
+The first track in the output is always the default track: the Mix when it exists, otherwise the first kept track. A Mix needs at least 2 tracks marked **In Mix**. With only one, that track is kept instead.
 
-| Source file | Mix + originals | Mix only | Mix off |
-|---|---|---|---|
-| 2 tracks | Mix · System sounds · Microphone | Mix | System sounds · Microphone |
-| 1 track | Audio | Audio | Audio |
-| 0 tracks | video only | video only | video only |
+#### Adding a track
+
+**+ Add a track…** makes the app look for an audio file with the **same name** next to each video:
+
+```
+recording.mp4   +   recording.wav   (or .mp3 .m4a .aac .flac .ogg .opus)
+```
+
+That file becomes an extra track, shown as **External** in the list (with its own In Mix / Keep / Name / Volume), and as `ext` in the file list before processing. Videos without such a file are processed as usual, and a 1-track video with an external file is mixed like a 2-track video.
+
+The audio file should start at the same moment as the video. If it's longer than the video, it's cut at the end of the video.
 
 ### Encoder reference
 

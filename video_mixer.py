@@ -6,7 +6,9 @@ Batch-process screen recordings with FFmpeg:
 
   * mixes audio track 1 (system sounds) + track 2 (microphone) into a new "Mix" track
   * keeps the original tracks, renamed ("System sounds", "Microphone")
-  * configurable track handling: Mix on/off, keep originals, what to do with 1-track / silent files
+  * per-track rules: which tracks go into the Mix and which are kept, based on a scan of the input folder
+  * can add an audio file with the same name as the video (recording.wav) as an extra track
+  * what to do with 1-track / silent files
   * re-encodes the video to AV1 or H.264 on CPU, NVIDIA (NVENC), Intel (QSV) or AMD (AMF)
 
 Settings are stored in settings.json next to this script / exe.
@@ -25,11 +27,12 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 try:
     import questionary
+    from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
     from questionary import Choice, Separator
     from rich import box
     from rich.console import Console, Group
@@ -58,7 +61,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 APP_NAME = "Video Mixer"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "settings.json"
 INPUT_EXTENSIONS = (".mp4",)
@@ -157,6 +160,32 @@ def video_args(encoder: str, quality: int, preset: str, ten_bit: bool) -> list[s
 
 SINGLE_TRACK_MODES = {"keep": "keep the track", "skip": "skip the file"}
 NO_AUDIO_MODES = {"encode": "encode video only", "skip": "skip the file"}
+EXTERNAL_EXTENSIONS = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus")
+VOLUME_RANGE = (0, 400)  # percent; 100 = unchanged
+
+
+def default_rule(i: int) -> dict:
+    """Rule for source audio track i (0-based): output name, In Mix / Keep, and volumes in percent.
+
+    mix_volume = how loud the track is inside the Mix (the microphone is 75% by default),
+    volume = how loud its own kept track is.
+    """
+    return {"name": ("System sounds", "Microphone")[i] if i < 2 else f"Track {i + 1}", "mix": True, "keep": True,
+            "mix_volume": 75 if i == 1 else 100, "volume": 100}
+
+
+def clean_rule(rule, fallback: dict) -> dict:
+    if not isinstance(rule, dict):
+        return dict(fallback)
+    name = rule.get("name")
+    clean = {"name": name.strip() if isinstance(name, str) and name.strip() else fallback["name"],
+             "mix": rule.get("mix") if isinstance(rule.get("mix"), bool) else fallback["mix"],
+             "keep": rule.get("keep") if isinstance(rule.get("keep"), bool) else fallback["keep"]}
+    for key in ("mix_volume", "volume"):
+        vol = rule.get(key)
+        valid = type(vol) is int and VOLUME_RANGE[0] <= vol <= VOLUME_RANGE[1]
+        clean[key] = vol if valid else fallback[key]
+    return clean
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,11 +202,12 @@ class Settings:
     fps: str = "60"  # a number, or "source" to keep the original frame rate
     audio_bitrate: str = "192k"
     mix_title: str = "Mix"
-    system_title: str = "System sounds"
-    mic_title: str = "Microphone"
     single_title: str = "Audio"
-    mix_enabled: bool = True  # create the "Mix" track when a file has 2+ audio tracks
-    keep_originals: bool = True  # keep the original tracks next to the Mix
+    mix_enabled: bool = True  # create the "Mix" track when 2+ tracks are marked "In Mix"
+    tracks: list = field(default_factory=lambda: [default_rule(0), default_rule(1)])  # rules per track number
+    external_audio: bool = False  # add "<video name>.wav/.mp3/…" next to the video as an extra track
+    external: dict = field(default_factory=lambda: {"name": "External audio", "mix": True, "keep": True,
+                                                    "mix_volume": 100, "volume": 100})
     single_track: str = "keep"  # files with 1 audio track: "keep" | "skip"
     no_audio: str = "encode"  # files without audio: "encode" (video only) | "skip"
     input_dir: str = ""  # empty = current folder
@@ -200,11 +230,23 @@ class Settings:
             s.single_track = cls.single_track
         if s.no_audio not in NO_AUDIO_MODES:
             s.no_audio = cls.no_audio
+        if "tracks" not in data:  # settings from v2.0: per-file track names + "keep originals"
+            keep = data.get("keep_originals", True) is not False or data.get("mix_enabled") is False
+            s.tracks = [{**default_rule(0), "keep": keep}, {**default_rule(1), "keep": keep}]
+            for i, old in enumerate(("system_title", "mic_title")):
+                if isinstance(data.get(old), str) and data[old].strip():
+                    s.tracks[i]["name"] = data[old].strip()
+        s.tracks = [clean_rule(r, default_rule(i)) for i, r in enumerate(s.tracks)]
+        s.external = clean_rule(s.external, cls().external)
         return s
 
     def save(self) -> None:
+        data = asdict(self)
+        # v2.0 fields, so an older version opened with this settings.json keeps the track names
+        data["system_title"], data["mic_title"] = self.rule(0)["name"], self.rule(1)["name"]
+        data["keep_originals"] = self.rule(0)["keep"] or self.rule(1)["keep"]
         try:
-            SETTINGS_FILE.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+            SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as e:
             console.print(f"[yellow]Could not save settings: {e}[/]")
 
@@ -228,12 +270,18 @@ class Settings:
         p = Path(name).expanduser()
         return p if p.is_absolute() else self.input_path() / p
 
+    def rule(self, i: int) -> dict:
+        """Rule for source audio track i (0-based). Tracks without a saved rule use the default."""
+        return self.tracks[i] if i < len(self.tracks) else default_rule(i)
+
     def audio_summary(self) -> str:
-        if not self.mix_enabled:
-            mode = "no Mix"
-        else:
-            mode = "Mix + originals" if self.keep_originals else "Mix only"
-        return f"{mode} · 1-track: {self.single_track} · no audio: {self.no_audio}"
+        rules = [(str(i + 1), r) for i, r in enumerate(self.tracks)]
+        if self.external_audio:
+            rules.append(("ext", self.external))
+        mix = "+".join(label for label, r in rules if r["mix"])
+        keep = ",".join(label for label, r in rules if r["keep"]) or "none"
+        mode = f"Mix {mix}" if self.mix_enabled and mix else "no Mix"
+        return f"{mode} · keep {keep} · 1-track: {self.single_track} · no audio: {self.no_audio}"
 
     def summary(self) -> str:
         spec = self.spec
@@ -326,38 +374,114 @@ def probe(path: Path) -> MediaInfo:
                      has_video=video is not None)
 
 
-def audio_plan(s: Settings, n: int) -> str | None:
-    """Short description of what happens to a file's n audio tracks, or None if the file is skipped."""
-    if n == 0:
-        return "no audio → video only" if s.no_audio == "encode" else None
-    if n == 1:
-        return "1 track → keep" if s.single_track == "keep" else None
-    if not s.mix_enabled:
-        return f"{n} tracks → keep"
-    return f"{n} tracks → Mix" + (" + originals" if s.keep_originals else " only")
+def find_external(video: Path) -> Path | None:
+    """An audio file with the same name next to the video (recording.mp4 → recording.wav / .mp3 / …)."""
+    for ext in EXTERNAL_EXTENSIONS:
+        p = video.with_suffix(ext)
+        if p.is_file():
+            return p
+    return None
 
 
-def track_title(s: Settings, i: int, n: int) -> str:
-    if n == 1:
-        return s.single_title
-    return (s.system_title, s.mic_title)[i] if i < 2 else f"Track {i + 1}"
+@dataclass
+class AudioSource:
+    spec: str  # ffmpeg stream specifier: "0:a:1" = track 2 of the video, "1:a:0" = the external file
+    label: str  # short label for the file list: "1", "2", "ext"
+    title: str  # track name in the output
+    volume: int = 100  # own kept track, percent; 100 = unchanged
+    mix_volume: int = 100  # inside the Mix, percent
 
 
-def build_command(s: Settings, src: Path, dst: Path, info: MediaInfo) -> list[str]:
-    cmd = [FFMPEG, "-y", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src), "-map", "0:v:0"]
+@dataclass
+class AudioPlan:
+    sources: int  # audio tracks available (video tracks + external file)
+    has_external: bool
+    mix: list[AudioSource]  # mixed into the "Mix" track (empty = no Mix)
+    keep: list[AudioSource]  # copied to the output as separate tracks
 
-    n = info.audio_streams
+    @property
+    def uses_external(self) -> bool:
+        return any(x.spec.startswith("1:") for x in self.mix + self.keep)
+
+    def describe(self) -> str:
+        n = self.sources - self.has_external
+        head = "no audio" if n == 0 else f"{n} track{'s' if n != 1 else ''}"
+        head = "ext" if n == 0 and self.has_external else head + (" + ext" if self.has_external else "")
+        parts = []
+        if self.mix:
+            parts.append("Mix " + "+".join(x.label for x in self.mix))
+        if self.keep:
+            parts.append("keep " + ",".join(x.label for x in self.keep))
+        return f"{head} → {' · '.join(parts) or 'video only'}"
+
+
+def plan_audio(s: Settings, info: MediaInfo, external: Path | None) -> AudioPlan | None:
+    """Which tracks go into the Mix and which are kept for one file, or None if the file is skipped."""
+    specs = [(f"0:a:{i}", str(i + 1), s.rule(i)) for i in range(info.audio_streams)]
+    if external:
+        specs.append(("1:a:0", "ext", s.external))
+    sources = [AudioSource(spec, label, r["name"], r["volume"], r["mix_volume"]) for spec, label, r in specs]
+    rules = [r for _, _, r in specs]
+    plan = AudioPlan(sources=len(sources), has_external=external is not None, mix=[], keep=[])
+
+    if not sources:
+        return plan if s.no_audio == "encode" else None
+    if len(sources) == 1:  # nothing to mix
+        if s.single_track == "skip":
+            return None
+        plan.keep = [replace(sources[0], title=s.single_title)]
+        return plan
+
+    mix = [x for x, r in zip(sources, rules) if r["mix"]] if s.mix_enabled else []
+    if len(mix) == 1:  # a Mix of one track is just that track: keep it instead
+        plan.keep = [x for x, r in zip(sources, rules) if r["keep"] or x is mix[0]]
+    else:
+        plan.mix = mix
+        plan.keep = [x for x, r in zip(sources, rules) if r["keep"]]
+    return plan
+
+
+def build_command(s: Settings, src: Path, dst: Path, info: MediaInfo, plan: AudioPlan,
+                  external: Path | None) -> list[str]:
+    cmd = [FFMPEG, "-y", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src)]
+    if external and plan.uses_external:
+        cmd += ["-i", str(external)]
+    cmd += ["-map", "0:v:0"]
+
+    # Each use of a track in the filter graph: its Mix input, and its kept track if that needs a volume change.
+    # A track used twice is split in two first; each part gets its own volume.
+    uses: dict[str, list[tuple[str, int]]] = {}
+    for x in plan.mix:
+        uses.setdefault(x.spec, []).append(("mix", x.mix_volume))
+    for x in plan.keep:
+        if x.volume != 100:
+            uses.setdefault(x.spec, []).append(("keep", x.volume))
+    filters: list[str] = []
+    pads: dict[tuple[str, str], str] = {}  # (spec, "mix" | "keep") → filter graph label
+    for n, (spec, spec_uses) in enumerate(uses.items()):
+        parts = [f"s{n}_{j}" for j in range(len(spec_uses))]
+        if len(spec_uses) > 1:
+            filters.append(f"[{spec}]asplit={len(spec_uses)}" + "".join(f"[{p}]" for p in parts))
+        else:
+            parts = [spec]
+        for (use, vol), part in zip(spec_uses, parts):
+            if vol == 100:
+                pads[(spec, use)] = f"[{part}]"
+            else:
+                filters.append(f"[{part}]volume={vol / 100:g}[v{n}_{use}]")
+                pads[(spec, use)] = f"[v{n}_{use}]"
+
     titles: list[str] = []
-    originals = range(n)
-    if n >= 2 and s.mix_enabled:
-        inputs = "".join(f"[0:a:{i}]" for i in range(n))
-        cmd += ["-filter_complex", f"{inputs}amix=inputs={n}:duration=longest[mix]", "-map", "[mix]"]
+    if plan.mix:
+        inputs = "".join(pads[(x.spec, "mix")] for x in plan.mix)
+        filters.append(f"{inputs}amix=inputs={len(plan.mix)}:duration=longest[mix]")
+        cmd += ["-filter_complex", ";".join(filters), "-map", "[mix]"]
         titles.append(s.mix_title)
-        if not s.keep_originals:
-            originals = range(0)
-    for i in originals:
-        cmd += ["-map", f"0:a:{i}"]
-        titles.append(track_title(s, i, n))
+    elif filters:
+        cmd += ["-filter_complex", ";".join(filters)]
+    for x in plan.keep:
+        cmd += ["-map", pads.get((x.spec, "keep"), x.spec)]
+        titles.append(x.title)
     for i, title in enumerate(titles):  # the first track (the Mix, if any) is the default
         cmd += [f"-metadata:s:a:{i}", f"title={title}", f"-disposition:a:{i}", "default" if i == 0 else "0"]
 
@@ -365,8 +489,10 @@ def build_command(s: Settings, src: Path, dst: Path, info: MediaInfo) -> list[st
     cmd += ["-color_range", "tv"]
     if s.fps != "source":
         cmd += ["-r", s.fps]
-    if info.audio_streams:
+    if titles:
         cmd += ["-c:a", "aac", "-b:a", s.audio_bitrate]
+    if plan.uses_external and info.duration:  # a longer external file must not make the output longer
+        cmd += ["-t", f"{info.duration:.3f}"]
     cmd += ["-progress", "pipe:1", "-nostats", str(dst)]
     return cmd
 
@@ -528,7 +654,12 @@ def process_all(s: Settings) -> None:
 
     with console.status("Reading media info…", spinner="dots"):
         infos = {p: probe(p) for p in todo}
-    by_rule = [p for p in todo if infos[p].has_video and audio_plan(s, infos[p].audio_streams) is None]
+        externals = {p: find_external(p) if s.external_audio else None for p in todo}
+        for p, ext in externals.items():
+            if ext and probe(ext).audio_streams == 0:  # not a readable audio file
+                externals[p] = None
+    plans = {p: plan_audio(s, infos[p], externals[p]) for p in todo}
+    by_rule = [p for p in todo if infos[p].has_video and plans[p] is None]
     todo = [p for p in todo if p not in by_rule]
 
     table = Table(box=box.SIMPLE_HEAD, header_style=f"bold {ACCENT2}", expand=False)
@@ -539,11 +670,11 @@ def process_all(s: Settings) -> None:
     table.add_column("Status")
     for i, p in enumerate(todo, 1):
         info = infos[p]
-        plan = audio_plan(s, info.audio_streams) if info.has_video else "[red]no video stream[/]"
+        plan = plans[p].describe() if info.has_video else "[red]no video stream[/]"
         table.add_row(str(i), p.name, fmt_size(p.stat().st_size), plan, "[green]queued[/]")
     for p in by_rule:
         n = infos[p].audio_streams
-        reason = "no audio" if n == 0 else "only 1 audio track"
+        reason = "no audio" if n + (externals[p] is not None) == 0 else "only 1 audio track"
         table.add_row("", f"[dim]{p.name}[/]", f"[dim]{fmt_size(p.stat().st_size)}[/]",
                       f"[dim]{n} track(s)[/]", f"[dim]skip ({reason})[/]")
     for p in skipped:
@@ -634,7 +765,7 @@ def process_all(s: Settings) -> None:
 
             t0 = time.monotonic()
             try:
-                code, errors = run_ffmpeg(build_command(s, src, dst, info), on_progress)
+                code, errors = run_ffmpeg(build_command(s, src, dst, info, plans[src], externals[src]), on_progress)
             except Cancelled:
                 cancelled = True
                 file_progress.remove_task(task)
@@ -746,6 +877,22 @@ def ask_text(msg: str, default: str, validate=None) -> str | None:
     return questionary.text(msg, default=default, validate=validate, style=QSTYLE).ask()
 
 
+def select(message: str, choices, back=None, **kwargs):
+    """questionary.select where Backspace goes back: it answers `back` (None = cancel, nothing changes)."""
+    kwargs.setdefault("style", QSTYLE)
+    kwargs.setdefault("instruction", "(↑↓ enter · ⌫ back)")
+    question = questionary.select(message, choices=choices, **kwargs)
+    keys = KeyBindings()
+
+    @keys.add("backspace", eager=True)
+    def _(event):
+        event.app.exit(result=back)
+
+    app = question.application
+    app.key_bindings = merge_key_bindings([app.key_bindings, keys]) if app.key_bindings else keys
+    return question
+
+
 def settings_menu(s: Settings) -> None:
     while True:
         header(s)
@@ -770,13 +917,12 @@ def settings_menu(s: Settings) -> None:
             Choice("Reset to defaults", "reset"),
             Choice("← Back", "back"),
         ]
-        key = questionary.select("Settings", choices=choices, style=QSTYLE, use_shortcuts=False,
-                                 instruction="(↑↓ enter)").ask()
+        key = select("Settings", choices=choices, back="back", use_shortcuts=False).ask()
         if key in (None, "back"):
             return
 
         if key == "codec":
-            codec = questionary.select("Video codec", choices=list(CODECS), default=s.codec, style=QSTYLE).ask()
+            codec = select("Video codec", choices=list(CODECS), default=s.codec, style=QSTYLE).ask()
             if codec and codec != s.codec:
                 same = next((e.name for e in ENCODERS.values()
                              if e.codec == codec and e.backend == spec.backend and e.name in AVAILABLE), None)
@@ -787,7 +933,7 @@ def settings_menu(s: Settings) -> None:
             opts = [Choice(f"{e.backend:<8}{e.label:<12}({e.name})", e.name,
                            disabled=None if e.name in AVAILABLE else "not available on this PC")
                     for e in ENCODERS.values() if e.codec == s.codec]
-            name = questionary.select("Encoder", choices=opts, style=QSTYLE,
+            name = select("Encoder", choices=opts, style=QSTYLE,
                                       default=s.encoder if s.encoder in AVAILABLE else None).ask()
             if name and name != s.encoder:
                 s.apply_encoder(name)
@@ -800,7 +946,7 @@ def settings_menu(s: Settings) -> None:
                 s.quality = int(val)
 
         elif key == "preset":
-            val = questionary.select(f"Preset   [{spec.preset_hint}]", choices=list(spec.presets),
+            val = select(f"Preset   [{spec.preset_hint}]", choices=list(spec.presets),
                                      default=s.preset if s.preset in spec.presets else None, style=QSTYLE).ask()
             if val:
                 s.preset = val
@@ -812,7 +958,7 @@ def settings_menu(s: Settings) -> None:
             opts = [Choice("keep source", "source")] + [Choice(f"{f} fps", f) for f in
                                                         ("24", "25", "30", "50", "60", "120")] + [
                        Choice("custom…", "custom")]
-            val = questionary.select("Output frame rate", choices=opts, style=QSTYLE).ask()
+            val = select("Output frame rate", choices=opts, style=QSTYLE).ask()
             if val == "custom":
                 val = ask_text("Frame rate:", s.fps if s.fps != "source" else "60",
                                lambda v: _num(v) > 0 or "Enter a positive number")
@@ -820,7 +966,7 @@ def settings_menu(s: Settings) -> None:
                 s.fps = val
 
         elif key == "bitrate":
-            val = questionary.select("AAC audio bitrate", choices=["96k", "128k", "160k", "192k", "256k", "320k"],
+            val = select("AAC audio bitrate", choices=["96k", "128k", "160k", "192k", "256k", "320k"],
                                      default=s.audio_bitrate if s.audio_bitrate.endswith("k") else None,
                                      style=QSTYLE).ask()
             if val:
@@ -856,48 +1002,171 @@ def settings_menu(s: Settings) -> None:
         s.save()
 
 
-def tracks_menu(s: Settings) -> None:
-    """Audio track options: Mix on/off, keep originals, 1-track and silent files, track names."""
+@dataclass
+class FolderScan:
+    videos: int = 0
+    track_counts: dict[int, int] = field(default_factory=dict)  # audio tracks per file → number of files
+    with_external: int = 0
+    error: str = ""
+
+    def files_with_track(self, i: int) -> int:
+        """How many videos have source track i (0-based)."""
+        return sum(files for n, files in self.track_counts.items() if n > i)
+
+    def describe(self) -> str:
+        if self.error:
+            return f"[yellow]{self.error}[/]"
+        if not self.videos:
+            return "[yellow]No videos found in the input folder[/]"
+        counts = " · ".join(f"{files} {'has' if files == 1 else 'have'} "
+                            + (f"{n} track{'s' if n != 1 else ''}" if n else "no audio")
+                            for n, files in sorted(self.track_counts.items(), reverse=True))
+        text = f"Found in input folder: [bold]{self.videos}[/] video{'s' if self.videos != 1 else ''} → {counts}"
+        if self.with_external:
+            text += f" · {self.with_external} with an external audio file"
+        return text
+
+
+def scan_folder(s: Settings) -> FolderScan:
+    """Count the audio tracks of every video in the input folder."""
+    if not s.input_path().is_dir():
+        return FolderScan(error=f"Input folder not found: {s.input_path()}")
+    todo, _ = list_inputs(s)
+    with console.status("Scanning the input folder…", spinner="dots"), ThreadPoolExecutor(max_workers=8) as pool:
+        infos = list(pool.map(probe, todo))
+    scan = FolderScan(videos=len(todo), with_external=sum(1 for p in todo if find_external(p)))
+    for info in infos:
+        scan.track_counts[info.audio_streams] = scan.track_counts.get(info.audio_streams, 0) + 1
+    return scan
+
+
+def edit_track(s: Settings, rule: dict, label: str, external: bool = False) -> None:
+    """Toggle In Mix / Keep, set the volumes and rename one track."""
     while True:
         header(s)
-        row = lambda k, v: f"{k:<28}{v}"  # noqa: E731
         onoff = lambda b: "on" if b else "off"  # noqa: E731
+        no_mix = "Mix is off" if not s.mix_enabled else None if rule["mix"] else "not in the Mix"
         choices = [
-            Choice(row('Create "Mix" track', onoff(s.mix_enabled)), "mix"),
-            Choice(row("Keep original tracks", onoff(s.keep_originals) if s.mix_enabled else "always (no Mix)"),
-                   "keep", disabled=None if s.mix_enabled else "only with Mix on"),
-            Choice(row("Files with 1 audio track", SINGLE_TRACK_MODES[s.single_track]), "single"),
-            Choice(row("Files with no audio", NO_AUDIO_MODES[s.no_audio]), "none"),
-            Choice(row("Track names", f"{s.mix_title} / {s.system_title} / {s.mic_title} / {s.single_title}"),
-                   "titles"),
+            Choice(f"{'In Mix':<20}{onoff(rule['mix'])}", "mix", disabled=None if s.mix_enabled else "Mix is off"),
+            Choice(f"{'Volume in Mix':<20}{rule['mix_volume']}%", "mix_volume", disabled=no_mix),
+            Choice(f"{'Keep':<20}{onoff(rule['keep'])}  (as its own track)", "keep"),
+            Choice(f"{'Volume (own track)':<20}{rule['volume']}%  (also used for 1-track files)", "volume"),
+            Choice(f"{'Name':<20}{rule['name']}", "name"),
+        ]
+        if external:
+            choices.append(Choice("Remove this track", "remove"))
+        choices += [Separator(), Choice("← Back", "back")]
+        key = select(label, choices=choices, back="back", use_shortcuts=False).ask()
+        if key in (None, "back"):
+            return
+        if key in ("mix", "keep"):
+            rule[key] = not rule[key]
+        elif key == "name":
+            val = ask_text("Track name:", rule["name"], lambda v: bool(v.strip()) or "Name cannot be empty")
+            if val:
+                rule["name"] = val.strip()
+        elif key in ("mix_volume", "volume"):
+            lo, hi = VOLUME_RANGE
+            where = "in the Mix" if key == "mix_volume" else "of its own track"
+            val = ask_text(f"Volume {where} in % ({lo}-{hi}, 100 = unchanged, 50 = half, 200 = double):",
+                           str(rule[key]),
+                           lambda v: (v.strip().rstrip("%").isdigit() and lo <= int(v.strip().rstrip("%")) <= hi)
+                           or f"Enter a number from {lo} to {hi}")
+            if val:
+                rule[key] = int(val.strip().rstrip("%"))
+        elif key == "remove":
+            s.external_audio = False
+            s.save()
+            return
+        s.save()
+
+
+def add_external(s: Settings) -> None:
+    header(s)
+    exts = " ".join(EXTERNAL_EXTENSIONS)
+    console.print(Panel(Text.from_markup(
+        "For every video, the app looks for an [bold]audio file with the same name[/] next to it:\n\n"
+        "    [yellow]recording.mp4[/]  +  [yellow]recording.wav[/]   [dim](or " + exts + ")[/]\n\n"
+        "That file is added as an extra track, and goes into the Mix.\n"
+        "Videos without such a file are processed as usual.\n\n"
+        "[dim]The audio file should start at the same moment as the video. "
+        "If it's longer, it's cut at the end of the video.[/]"),
+        title="[bold]Add a track: audio file with the same name", border_style=ACCENT2, expand=False,
+        padding=(1, 3)))
+    if questionary.confirm("Add this track?", default=True, style=QSTYLE).ask():
+        s.external_audio = True
+        s.save()
+
+
+MIX_LABEL = 'Create "Mix" track'
+
+
+def tracks_menu(s: Settings) -> None:
+    """Audio track options: scan the input folder, then Mix / Keep / name per track."""
+    scan = scan_folder(s)
+    while True:
+        header(s)
+        console.print(f"  {scan.describe()}\n")
+        rows = max(len(s.tracks), max(scan.track_counts, default=0), 2)
+        def track_row(label: str, rule: dict, note: str) -> str:
+            name = rule["name"] if len(rule["name"]) <= 20 else rule["name"][:19] + "…"
+            in_mix = ("✓ " + f"{rule['mix_volume']}%" if rule["mix"] else "✗") if s.mix_enabled else "–"
+            keep = "✓ " + f"{rule['volume']}%" if rule["keep"] else "✗"
+            return f"{label:<11}{name:<22}{in_mix:<10}{keep:<10}{note}"
+
+        choices = [
+            Choice(f"{MIX_LABEL:<33}{'on' if s.mix_enabled else 'off'}", "mix"),
+            Separator(f"  {'Track':<11}{'Name':<22}{'In Mix':<10}{'Keep':<10}"),
+        ]
+        for i in range(rows):
+            note = f"in {scan.files_with_track(i)}/{scan.videos} videos" if scan.videos else ""
+            choices.append(Choice(track_row(f"Track {i + 1}", s.rule(i), note), f"track:{i}"))
+        if s.external_audio:
+            note = f"found for {scan.with_external}/{scan.videos} videos" if scan.videos else ""
+            choices.append(Choice(track_row("External", s.external, note), "external"))
+        else:
+            choices.append(Choice("+ Add a track…  (audio file with the same name)", "add"))
+        choices += [
             Separator(),
+            Choice(f"{'Files with 1 audio track':<33}{SINGLE_TRACK_MODES[s.single_track]}", "single"),
+            Choice(f"{'Files with no audio':<33}{NO_AUDIO_MODES[s.no_audio]}", "none"),
+            Choice(f"{'Mix / 1-track names':<33}{s.mix_title} / {s.single_title}", "titles"),
+            Separator(),
+            Choice("↻ Rescan input folder", "rescan"),
             Choice("← Back", "back"),
         ]
-        key = questionary.select("Audio tracks", choices=choices, style=QSTYLE, use_shortcuts=False,
-                                 instruction="(↑↓ enter)").ask()
+        key = select("Audio tracks", choices=choices, back="back", use_shortcuts=False).ask()
         if key in (None, "back"):
             return
 
         if key == "mix":
             s.mix_enabled = not s.mix_enabled
-        elif key == "keep":
-            s.keep_originals = not s.keep_originals
+        elif key.startswith("track:"):
+            i = int(key.partition(":")[2])
+            while len(s.tracks) <= i:  # save a rule for this track number so it can be changed
+                s.tracks.append(default_rule(len(s.tracks)))
+            edit_track(s, s.tracks[i], f"Track {i + 1}")
+        elif key == "external":
+            edit_track(s, s.external, "External audio file", external=True)
+        elif key == "add":
+            add_external(s)
+        elif key == "rescan":
+            scan = scan_folder(s)
         elif key == "single":
-            val = questionary.select("Files with only 1 audio track (nothing to mix)",
+            val = select("Files with only 1 audio track (nothing to mix)",
                                      choices=[Choice(v, k) for k, v in SINGLE_TRACK_MODES.items()],
                                      default=s.single_track, style=QSTYLE).ask()
             if val:
                 s.single_track = val
         elif key == "none":
-            val = questionary.select("Files with no audio track",
+            val = select("Files with no audio track",
                                      choices=[Choice(v, k) for k, v in NO_AUDIO_MODES.items()],
                                      default=s.no_audio, style=QSTYLE).ask()
             if val:
                 s.no_audio = val
         elif key == "titles":
             nonempty = lambda v: bool(v.strip()) or "Name cannot be empty"  # noqa: E731
-            for attr, label in (("mix_title", "Mixed track"), ("system_title", "Original track 1"),
-                                ("mic_title", "Original track 2"), ("single_title", "Only track (1-track files)")):
+            for attr, label in (("mix_title", "Mixed track"), ("single_title", "Only track (1-track files)")):
                 val = ask_text(f"{label}:", getattr(s, attr), nonempty)
                 if val is None:
                     break
